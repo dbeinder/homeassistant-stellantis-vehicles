@@ -530,11 +530,25 @@ class StellantisVehicles(StellantisOauth):
             elif get_datetime() > get_next_run():
                 await self.refresh_token_request()
             next_run = get_next_run()
-        except ComunicationError:
-            next_run = get_datetime() + timedelta(minutes=5)
+        except ConfigEntryAuthFailed:
+            # The refresh token chain is dead (invalid_grant: reuse outside the rotation grace
+            # window, expiry, or revocation). Retrying cannot recover it -- start HA reauth and
+            # stop the loop; there is nothing to reschedule until the user re-authenticates.
+            _LOGGER.warning("OAuth refresh token rejected (invalid_grant); starting reauth")
+            self._entry.async_start_reauth(self._hass)
+            _LOGGER.debug("---------- END scheduled_oauth_token_refresh")
+            return
         except RateLimitException:
             _LOGGER.warning("Rate limit exceeded, retry after 30 mins or check logs and restart integration")
             next_run = get_datetime() + timedelta(minutes=30)
+        except Exception as e:
+            # Never let the refresh timer die un-rescheduled. Besides ComunicationError, an
+            # overloaded backend can return a malformed/truncated body (-> JSONDecodeError) or an
+            # unexpected 200 (-> KeyError); if either escaped here the timer would never re-arm,
+            # token refresh would silently stop, and every API call would start failing with 401
+            # until HA is restarted. Reschedule a short retry instead.
+            _LOGGER.warning(f"OAuth token refresh failed, will retry in 5 min: {e}")
+            next_run = get_datetime() + timedelta(minutes=5)
         _LOGGER.debug(f"Current time: {get_datetime()}")
         _LOGGER.debug(f"Next refresh: {next_run}")
         next_job = HassJob(self.scheduled_oauth_token_refresh, f"{DOMAIN} refresh oauth token: {next_run}", cancel_on_shutdown=True)
@@ -546,7 +560,32 @@ class StellantisVehicles(StellantisOauth):
         _LOGGER.debug("---------- START refresh_token_request")
         url = self.apply_query_params(OAUTH_TOKEN_URL, OAUTH_REFRESH_TOKEN_QUERY_PARAMS)
         headers = self.apply_dict_params(OAUTH_TOKEN_HEADERS)
-        token_request = await self.make_http_request(url, 'POST', headers)
+        # AM rotates the refresh token on every use and immediately invalidates the previous one,
+        # keeping it replayable only for a short "grace period" (ForgeRock/PingAM default 30s,
+        # max 60s). If a rotation response is lost to the (frequently overloaded) Stellantis
+        # backend, the recovery AM intends is to REPLAY THE SAME old refresh token within that
+        # window to obtain the rotated one. So on a transient failure we retry quickly, reusing
+        # the unchanged stored token -- url/headers are built once, before any save -- instead of
+        # waiting minutes (the old 5-min retry always landed OUTSIDE the grace window, which
+        # revokes the whole token chain and forces a re-login). A generous per-request timeout
+        # also lets a slow-but-alive backend answer rather than being abandoned mid-rotation.
+        # NOTE: this best recovers fast-failing errors (connection reset) which retry well inside
+        # the window; a full timeout hang may still exceed a 30s grace. If the grace is 0 the race
+        # is unrecoverable regardless.
+        FAST_RETRIES = 3
+        REFRESH_TIMEOUT = 120
+        for attempt in range(1, FAST_RETRIES + 1):
+            try:
+                token_request = await self.make_http_request(url, 'POST', headers, timeout=REFRESH_TIMEOUT)
+                break
+            except ConfigEntryAuthFailed:
+                # invalid_grant -> chain already dead; retrying cannot help. Propagate to reauth.
+                raise
+            except ComunicationError as e:
+                if attempt >= FAST_RETRIES:
+                    raise
+                _LOGGER.warning(f"OAuth refresh attempt {attempt}/{FAST_RETRIES} failed ({e}); fast retry to stay within the rotation grace window")
+                await asyncio.sleep(3)
         self.logger_filter.add_custom_value(token_request["access_token"])
         self.logger_filter.add_custom_value(token_request["refresh_token"])
         _LOGGER.debug(url)
@@ -673,6 +712,16 @@ class StellantisVehicles(StellantisOauth):
             _LOGGER.error("MQTT authentication error. To enable remote commands again please reconfigure the integration")
             _LOGGER.debug("---------- END scheduled_mqtt_token_refresh")
             return
+        except Exception as e:
+            # Never let the MQTT refresh timer die un-rescheduled. Besides the handled cases, an
+            # overloaded backend can return a malformed/truncated body (-> JSONDecodeError) or some
+            # other unexpected error from make_http_request; if it escaped here the timer would
+            # never re-arm and remote commands would silently stop working (only partially
+            # self-healed by an MQTT_ERR_AUTH disconnect) until HA is restarted. Reschedule a short
+            # retry instead. (No fast in-grace retry here: unlike ForgeRock AM, the connectedcar
+            # token endpoint's rotation behaviour is uncharacterised, so we don't replay tokens.)
+            _LOGGER.warning(f"MQTT token refresh failed, will retry in 5 min: {e}")
+            next_run = get_datetime() + timedelta(minutes=5)
         _LOGGER.debug(f"Current time: {get_datetime()}")
         _LOGGER.debug(f"Next refresh: {next_run}")
         next_job = HassJob(self.scheduled_mqtt_token_refresh, f"{DOMAIN} refresh mqtt token: {next_run}", cancel_on_shutdown=True)

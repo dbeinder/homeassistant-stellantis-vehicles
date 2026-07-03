@@ -55,9 +55,10 @@ OAUTH_REMOTE_SCHEMA = vol.Schema({
     vol.Required(CONF_PASSWORD): str
 })
 
-OTP_CONFIGURE_SCHEMA = vol.Schema({
-    vol.Required(FIELD_REMOTE_COMMANDS, default=False): bool
-})
+def OTP_CONFIGURE_SCHEMA(default=False):
+    return vol.Schema({
+        vol.Required(FIELD_REMOTE_COMMANDS, default=default): bool
+    })
 
 OTP_SCHEMA = vol.Schema({
     vol.Required(FIELD_SMS_CODE): str,
@@ -191,7 +192,14 @@ class StellantisVehiclesConfigFlow(ConfigFlow, domain=DOMAIN):
             }}
             self.data.update(oauth)
             self.stellantis.save_config(oauth)
-            return self.async_show_form(step_id="get_access_token", data_schema=OTP_CONFIGURE_SCHEMA)
+            # Reauth is a token-only renewal: skip the remote-commands checkbox and finalize,
+            # preserving the existing remote_commands flag and OTP enrollment. final()'s
+            # data_updates merge keeps every key we don't touch (customer_id, mqtt, prefs...).
+            if self.source == SOURCE_REAUTH:
+                return await self.async_step_final()
+            # Default the checkbox to the current config so reconfigure keeps remote commands
+            # unless the user actively opts out (first install has no value set -> defaults False).
+            return self.async_show_form(step_id="get_access_token", data_schema=OTP_CONFIGURE_SCHEMA(self.data.get(FIELD_REMOTE_COMMANDS, False)))
 
         self.data.update({FIELD_REMOTE_COMMANDS: user_input[FIELD_REMOTE_COMMANDS]})
         self.stellantis.save_config({FIELD_REMOTE_COMMANDS: self.data[FIELD_REMOTE_COMMANDS]})
