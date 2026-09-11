@@ -296,8 +296,8 @@ Dave
 
 **⭐ 1 BEERS**  
 Someone  
-lmz  
 Someone  
+lmz  
 <sub>*and other heroes*</sub>
 
 ### Want to join the Club?
